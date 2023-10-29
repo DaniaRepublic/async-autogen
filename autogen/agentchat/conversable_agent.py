@@ -124,6 +124,7 @@ class ConversableAgent(Agent):
         self._reply_func_list = []
         self.reply_at_receive = defaultdict(bool)
         self.register_reply([Agent, None], ConversableAgent.generate_oai_reply)
+        self.register_reply([Agent, None], ConversableAgent.a_generate_oai_reply)
         self.register_reply([Agent, None], ConversableAgent.generate_code_execution_reply)
         self.register_reply([Agent, None], ConversableAgent.generate_function_call_reply)
         self.register_reply([Agent, None], ConversableAgent.check_termination_and_human_reply)
@@ -608,6 +609,25 @@ class ConversableAgent(Agent):
         )
         return True, oai.ChatCompletion.extract_text_or_function_call(response)[0]
 
+    async def a_generate_oai_reply(
+        self,
+        messages: Optional[List[Dict]] = None,
+        sender: Optional[Agent] = None,
+        config: Optional[Any] = None,
+    ) -> Tuple[bool, Union[str, Dict, None]]:
+        """Generate a reply using autogen.oai."""
+        llm_config = self.llm_config if config is None else config
+        if llm_config is False:
+            return False, None
+        if messages is None:
+            messages = self._oai_messages[sender]
+
+        # TODO: #1143 handle token limit exceeded error
+        response = await oai.ChatCompletion.a_create(
+            context=messages[-1].pop("context", None), messages=self._oai_system_message + messages, **llm_config
+        )
+        return True, oai.ChatCompletion.extract_text_or_function_call(response)[0]
+
     def generate_code_execution_reply(
         self,
         messages: Optional[List[Dict]] = None,
@@ -832,7 +852,8 @@ class ConversableAgent(Agent):
                         self, messages=messages, sender=sender, config=reply_func_tuple["config"]
                     )
                 else:
-                    final, reply = reply_func(self, messages=messages, sender=sender, config=reply_func_tuple["config"])
+                    continue
+                    # final, reply = reply_func(self, messages=messages, sender=sender, config=reply_func_tuple["config"])
                 if final:
                     return reply
         return self._default_auto_reply

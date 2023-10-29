@@ -1,4 +1,5 @@
 from time import sleep
+from asyncio import sleep as asleep
 import logging
 import time
 from typing import List, Optional, Dict, Callable, Union
@@ -251,6 +252,88 @@ class Completion(openai_Completion):
                     request_timeout = min(request_timeout, time_left)
                     logger.info(f"retrying in {retry_wait_time} seconds...", exc_info=1)
                     sleep(retry_wait_time)
+                elif raise_on_ratelimit_or_timeout:
+                    raise
+                else:
+                    response = -1
+                    if use_cache and isinstance(err, Timeout):
+                        cls._cache.set(key, response)
+                    logger.warning(
+                        f"Failed to get response from openai api due to getting RateLimitError or Timeout for {max_retry_period} seconds."
+                    )
+                    return response
+            except InvalidRequestError:
+                if "azure" in config.get("api_type", openai.api_type) and "model" in config:
+                    # azure api uses "engine" instead of "model"
+                    config["engine"] = config.pop("model").replace("gpt-3.5-turbo", "gpt-35-turbo")
+                else:
+                    raise
+            else:
+                if use_cache:
+                    cls._cache.set(key, response)
+                cls._book_keeping(config, response)
+                return response
+
+    @classmethod
+    async def _a_get_response(cls, config: Dict, raise_on_ratelimit_or_timeout=False, use_cache=True):
+        """Get the response from the openai api call.
+
+        Try cache first. If not found, call the openai api. If the api call fails, retry after retry_wait_time.
+        """
+        config = config.copy()
+        openai.api_key_path = config.pop("api_key_path", openai.api_key_path)
+        key = get_key(config)
+        if use_cache:
+            response = cls._cache.get(key, None)
+            if response is not None and (response != -1 or not raise_on_ratelimit_or_timeout):
+                # print("using cached response")
+                cls._book_keeping(config, response)
+                return response
+        openai_completion = (
+            openai.ChatCompletion
+            if config["model"].replace("gpt-35-turbo", "gpt-3.5-turbo") in cls.chat_models
+            or issubclass(cls, ChatCompletion)
+            else openai.Completion
+        )
+        start_time = time.time()
+        request_timeout = cls.request_timeout
+        max_retry_period = config.pop("max_retry_period", cls.max_retry_period)
+        retry_wait_time = config.pop("retry_wait_time", cls.retry_wait_time)
+        while True:
+            try:
+                if "request_timeout" in config:
+                    response = await openai_completion.acreate(**config)
+                else:
+                    response = await openai_completion.acreate(request_timeout=request_timeout, **config)
+            except (
+                ServiceUnavailableError,
+                APIConnectionError,
+            ):
+                # transient error
+                logger.info(f"retrying in {retry_wait_time} seconds...", exc_info=1)
+                await asleep(retry_wait_time)
+            except APIError as err:
+                error_code = err and err.json_body and isinstance(err.json_body, dict) and err.json_body.get("error")
+                error_code = error_code and error_code.get("code")
+                if error_code == "content_filter":
+                    raise
+                # transient error
+                logger.info(f"retrying in {retry_wait_time} seconds...", exc_info=1)
+                await asleep(retry_wait_time)
+            except (RateLimitError, Timeout) as err:
+                time_left = max_retry_period - (time.time() - start_time + retry_wait_time)
+                if (
+                    time_left > 0
+                    and isinstance(err, RateLimitError)
+                    or time_left > request_timeout
+                    and isinstance(err, Timeout)
+                    and "request_timeout" not in config
+                ):
+                    if isinstance(err, Timeout):
+                        request_timeout <<= 1
+                    request_timeout = min(request_timeout, time_left)
+                    logger.info(f"retrying in {retry_wait_time} seconds...", exc_info=1)
+                    await asleep(retry_wait_time)
                 elif raise_on_ratelimit_or_timeout:
                     raise
                 else:
@@ -832,6 +915,137 @@ class Completion(openai_Completion):
         with diskcache.Cache(cls.cache_path) as cls._cache:
             cls.set_cache(seed)
             return cls._get_response(params, raise_on_ratelimit_or_timeout=raise_on_ratelimit_or_timeout)
+
+    @classmethod
+    async def a_create(
+        cls,
+        context: Optional[Dict] = None,
+        use_cache: Optional[bool] = True,
+        config_list: Optional[List[Dict]] = None,
+        filter_func: Optional[Callable[[Dict, Dict, Dict], bool]] = None,
+        raise_on_ratelimit_or_timeout: Optional[bool] = True,
+        allow_format_str_template: Optional[bool] = False,
+        **config,
+    ):
+        """Make a completion for a given context.
+
+        Args:
+            context (Dict, Optional): The context to instantiate the prompt.
+                It needs to contain keys that are used by the prompt template or the filter function.
+                E.g., `prompt="Complete the following sentence: {prefix}, context={"prefix": "Today I feel"}`.
+                The actual prompt will be:
+                "Complete the following sentence: Today I feel".
+                More examples can be found at [templating](https://microsoft.github.io/autogen/docs/Use-Cases/enhanced_inference#templating).
+            use_cache (bool, Optional): Whether to use cached responses.
+            config_list (List, Optional): List of configurations for the completion to try.
+                The first one that does not raise an error will be used.
+                Only the differences from the default config need to be provided.
+                E.g.,
+
+        ```python
+        response = oai.Completion.create(
+            config_list=[
+                {
+                    "model": "gpt-4",
+                    "api_key": os.environ.get("AZURE_OPENAI_API_KEY"),
+                    "api_type": "azure",
+                    "api_base": os.environ.get("AZURE_OPENAI_API_BASE"),
+                    "api_version": "2023-03-15-preview",
+                },
+                {
+                    "model": "gpt-3.5-turbo",
+                    "api_key": os.environ.get("OPENAI_API_KEY"),
+                    "api_type": "open_ai",
+                    "api_base": "https://api.openai.com/v1",
+                },
+                {
+                    "model": "llama-7B",
+                    "api_base": "http://127.0.0.1:8080",
+                    "api_type": "open_ai",
+                }
+            ],
+            prompt="Hi",
+        )
+        ```
+
+            filter_func (Callable, Optional): A function that takes in the context, the config and the response and returns a boolean to indicate whether the response is valid. E.g.,
+
+        ```python
+        def yes_or_no_filter(context, config, response):
+            return context.get("yes_or_no_choice", False) is False or any(
+                text in ["Yes.", "No."] for text in oai.Completion.extract_text(response)
+            )
+        ```
+
+            raise_on_ratelimit_or_timeout (bool, Optional): Whether to raise RateLimitError or Timeout when all configs fail.
+                When set to False, -1 will be returned when all configs fail.
+            allow_format_str_template (bool, Optional): Whether to allow format string template in the config.
+            **config: Configuration for the openai API call. This is used as parameters for calling openai API.
+                The "prompt" or "messages" parameter can contain a template (str or Callable) which will be instantiated with the context.
+                Besides the parameters for the openai API call, it can also contain:
+                - `max_retry_period` (int): the total time (in seconds) allowed for retrying failed requests.
+                - `retry_wait_time` (int): the time interval to wait (in seconds) before retrying a failed request.
+                - `seed` (int) for the cache. This is useful when implementing "controlled randomness" for the completion.
+
+        Returns:
+            Responses from OpenAI API, with additional fields.
+                - `cost`: the total cost.
+            When `config_list` is provided, the response will contain a few more fields:
+                - `config_id`: the index of the config in the config_list that is used to generate the response.
+                - `pass_filter`: whether the response passes the filter function. None if no filter is provided.
+        """
+        if ERROR:
+            raise ERROR
+
+        # Warn if a config list was provided but was empty
+        if type(config_list) is list and len(config_list) == 0:
+            logger.warning(
+                "Completion was provided with a config_list, but the list was empty. Adopting default OpenAI behavior, which reads from the 'model' parameter instead."
+            )
+
+        if config_list:
+            last = len(config_list) - 1
+            cost = 0
+            for i, each_config in enumerate(config_list):
+                base_config = config.copy()
+                base_config["allow_format_str_template"] = allow_format_str_template
+                base_config.update(each_config)
+                if i < last and filter_func is None and "max_retry_period" not in base_config:
+                    # max_retry_period = 0 to avoid retrying when no filter is given
+                    base_config["max_retry_period"] = 0
+                try:
+                    response = await cls.a_create(
+                        context,
+                        use_cache,
+                        raise_on_ratelimit_or_timeout=i < last or raise_on_ratelimit_or_timeout,
+                        **base_config,
+                    )
+                    if response == -1:
+                        return response
+                    pass_filter = filter_func is None or filter_func(
+                        context=context, base_config=config, response=response
+                    )
+                    if pass_filter or i == last:
+                        response["cost"] = cost + response["cost"]
+                        response["config_id"] = i
+                        response["pass_filter"] = pass_filter
+                        return response
+                    cost += response["cost"]
+                except (AuthenticationError, RateLimitError, Timeout, InvalidRequestError):
+                    logger.debug(f"failed with config {i}", exc_info=1)
+                    if i == last:
+                        raise
+        params = cls._construct_params(context, config, allow_format_str_template=allow_format_str_template)
+        if not use_cache:
+            return await cls._a_get_response(
+                params, raise_on_ratelimit_or_timeout=raise_on_ratelimit_or_timeout, use_cache=False
+            )
+        seed = cls.seed
+        if "seed" in params:
+            cls.set_cache(params.pop("seed"))
+        with diskcache.Cache(cls.cache_path) as cls._cache:
+            cls.set_cache(seed)
+            return await cls._a_get_response(params, raise_on_ratelimit_or_timeout=raise_on_ratelimit_or_timeout)
 
     @classmethod
     def instantiate(

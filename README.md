@@ -1,10 +1,33 @@
-[![PyPI version](https://badge.fury.io/py/pyautogen.svg)](https://badge.fury.io/py/pyautogen)
-[![Build](https://github.com/microsoft/autogen/actions/workflows/python-package.yml/badge.svg)](https://github.com/microsoft/autogen/actions/workflows/python-package.yml)
-![Python Version](https://img.shields.io/badge/3.8%20%7C%203.9%20%7C%203.10%20%7C%203.11-blue)
-[![Downloads](https://static.pepy.tech/badge/pyautogen/week)](https://pepy.tech/project/pyautogen)
-[![](https://img.shields.io/discord/1153072414184452236?logo=discord&style=flat)](https://discord.gg/pAbnFJrkgZ)
+# Asyncronous AutoGen
 
-This project is a spinoff from [FLAML](https://github.com/microsoft/FLAML).
+## Changes
+
+Async agent functionality for AutoGen
+
+Changes: 
+
+1. ConversableAgent:
+   
+   new async a_generate_oai_reply version of generate_oai_reply
+   
+   registered this function with register_reply in __init__
+   
+   a_generate_oai_reply now only recognizes async replies
+
+2. Completion:
+   
+   imported sleep from asyncio to use instead of default time.sleep in _a_get_response
+   
+   added _a_get_response method with async calls to oai and sleep
+   
+   added a_create method with async calls to _a_get_response
+
+## Version
+
+Fork was made off of __version__ = "0.1.14"
+
+---
+---
 
 # AutoGen
 
